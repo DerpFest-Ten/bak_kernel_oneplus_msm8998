@@ -36,10 +36,10 @@ struct cpu_sync {
 	unsigned int input_boost_freq_s2;
 };
 
-static struct cpu_sync cluster0_si;
-static struct cpu_sync cluster1_si;
+static DEFINE_PER_CPU(struct cpu_sync, sync_info);
 
-static bool input_boost_enabled;
+static unsigned int input_boost_enabled = 1;
+module_param(input_boost_enabled, uint, 0644);
 
 static unsigned int input_boost_ms = 40;
 module_param(input_boost_ms, uint, 0644);
@@ -64,24 +64,51 @@ static struct task_struct *cpu_boost_worker_thread;
 
 static int set_input_boost_freq(const char *buf, const struct kernel_param *kp, int step)
 {
-	int c0_freq, c1_freq;
+	int i, ntokens = 0;
+	unsigned int val, cpu;
+	const char *cp = buf;
 
-	if (sscanf(buf, "%d %d", &c0_freq, &c1_freq) != 2)
-		return -EINVAL;
+	while ((cp = strpbrk(cp + 1, " :")))
+		ntokens++;
 
-	if (step == 1) {
-		cluster0_si.input_boost_freq = c0_freq;
-		cluster1_si.input_boost_freq = c1_freq;
-	} else if (step == 2) {
-		cluster0_si.input_boost_freq_s2 = c0_freq;
-		cluster1_si.input_boost_freq_s2 = c1_freq;
+	/* single number: apply to all CPUs */
+	if (!ntokens) {
+		if (sscanf(buf, "%u\n", &val) != 1)
+			return -EINVAL;
+		for_each_possible_cpu(i) {
+			if (step == 1)
+				per_cpu(sync_info, i).input_boost_freq = val;
+			else if (step == 2)
+				per_cpu(sync_info, i).input_boost_freq_s2 = val;
+		}
+		if (step == 1)
+			goto check_enable;
+		else if (step == 2)
+			/* Don't think about disabling input boost for step 2 configuration cases */
+			return 0;
 	}
 
-	if (c0_freq || c1_freq)
-		input_boost_enabled = true;
-	else
-		input_boost_enabled = false;
+	/* CPU:value pair */
+	if (!(ntokens % 2))
+		return -EINVAL;
 
+	cp = buf;
+	for (i = 0; i < ntokens; i += 2) {
+		if (sscanf(cp, "%u:%u", &cpu, &val) != 2)
+			return -EINVAL;
+		if (cpu > num_possible_cpus())
+			return -EINVAL;
+
+		if (step == 1)
+			per_cpu(sync_info, i).input_boost_freq = val;
+		else if (step == 2)
+			per_cpu(sync_info, i).input_boost_freq_s2 = val;
+
+		cp = strchr(cp, ' ');
+		cp++;
+	}
+
+out:
 	return 0;
 }
 static inline int set_input_boost_freq_s1(const char *buf, const struct kernel_param *kp)
@@ -96,12 +123,21 @@ static inline int set_input_boost_freq_s2(const char *buf, const struct kernel_p
 
 static int get_input_boost_freq(char *buf, const struct kernel_param *kp, int step)
 {
-	if (step == 1)
-		return snprintf(buf, PAGE_SIZE, "%d %d",
-			cluster0_si.input_boost_freq, cluster1_si.input_boost_freq);
-	else
-		return snprintf(buf, PAGE_SIZE, "%d %d",
-			cluster0_si.input_boost_freq_s2, cluster1_si.input_boost_freq_s2);
+	int cnt = 0, cpu, target_input_freq;
+	struct cpu_sync *s;
+
+	for_each_possible_cpu(cpu) {
+		s = &per_cpu(sync_info, cpu);
+		if (step == 1)
+			target_input_freq = s->input_boost_freq;
+		else if (step == 2)
+			target_input_freq = s->input_boost_freq_s2;
+
+		cnt += snprintf(buf + cnt, PAGE_SIZE - cnt,
+				"%d:%u ", cpu, target_input_freq);
+	}
+	cnt += snprintf(buf + cnt, PAGE_SIZE - cnt, "\n");
+	return cnt;
 }
 
 static inline int get_input_boost_freq_s1(char *buf, const struct kernel_param *kp)
@@ -140,17 +176,9 @@ static int boost_adjust_notify(struct notifier_block *nb, unsigned long val,
 				void *data)
 {
 	struct cpufreq_policy *policy = data;
-	unsigned int cpu;
-	unsigned int ib_min = cluster1_si.input_boost_min;
-
-	/*
-	 * Go through affected_cpus
-	 * and see if the requested CPU is on the 1st cluster
-	 */
-	for_each_cpu(cpu, policy->cpus) {
-		if (cpu == 0)
-			ib_min = cluster0_si.input_boost_min;
-	}
+	unsigned int cpu = policy->cpu;
+	struct cpu_sync *s = &per_cpu(sync_info, cpu);
+	unsigned int ib_min = s->input_boost_min;
 
 	switch (val) {
 	case CPUFREQ_ADJUST:
@@ -205,16 +233,22 @@ static void update_policy_online(void)
 
 static void do_input_boost_rem(struct work_struct *work)
 {
+	unsigned int i, ret;
+	struct cpu_sync *i_sync_info;
+
 	/* Reset the input_boost_min for all CPUs in the system */
 	pr_debug("Resetting input boost min for all CPUs\n");
-	cluster0_si.input_boost_min = 0;
-	cluster1_si.input_boost_min = 0;
+	for_each_possible_cpu(i) {
+		i_sync_info = &per_cpu(sync_info, i);
+		i_sync_info->input_boost_min = 0;
+	}
 
 	/* Update policies for all online CPUs */
 	update_policy_online();
 
 	if (sched_boost_active) {
-		if (sched_set_boost(0))
+		ret = sched_set_boost(0);
+		if (ret)
 			pr_err("cpu-boost: HMP boost disable failed\n");
 		sched_boost_active = false;
 	}
@@ -222,10 +256,15 @@ static void do_input_boost_rem(struct work_struct *work)
 
 static void do_input_boost_s2(struct work_struct *work)
 {
+	unsigned int i;
+	struct cpu_sync *i_sync_info;
+
 	/* Set the input_boost_min for all CPUs in the system */
 	pr_debug("Step 2: Setting input boost min for all CPUs\n");
-	cluster0_si.input_boost_min = cluster0_si.input_boost_freq_s2;
-	cluster1_si.input_boost_min = cluster1_si.input_boost_freq_s2;
+	for_each_possible_cpu(i) {
+		i_sync_info = &per_cpu(sync_info, i);
+		i_sync_info->input_boost_min = i_sync_info->input_boost_freq_s2;
+	}
 
 	/* Update policies for all online CPUs */
 	update_policy_online();
@@ -236,6 +275,9 @@ static void do_input_boost_s2(struct work_struct *work)
 
 static void do_input_boost(struct kthread_work *work)
 {
+	unsigned int i, ret;
+	struct cpu_sync *i_sync_info;
+
 	if (!input_boost_ms)
 		return;
 
@@ -249,15 +291,29 @@ static void do_input_boost(struct kthread_work *work)
 
 	/* Set the input_boost_min for all CPUs in the system */
 	pr_debug("Setting input boost min for all CPUs\n");
-	cluster0_si.input_boost_min = cluster0_si.input_boost_freq;
-	cluster1_si.input_boost_min = cluster1_si.input_boost_freq;
+	for_each_possible_cpu(i) {
+		i_sync_info = &per_cpu(sync_info, i);
+
+		// cpu 0-3 -> silver cluster
+		// cpu 4-7 -> gold cluster
+		// to save power there's no point in boosting the
+		// gold cluster core if it doesn't have any runnable
+		// thread at this point in time
+		// since inputs are fairly common we might save some
+		// juice in the long run
+		if (i >= 4 && cpu_rq(i)->nr_running == 0)
+			continue;
+
+		i_sync_info->input_boost_min = i_sync_info->input_boost_freq;
+	}
 
 	/* Update policies for all online CPUs */
 	update_policy_online();
 
 	/* Enable scheduler boost to migrate tasks to big cluster */
 	if (sched_boost_on_input) {
-		if (sched_set_boost(1))
+		ret = sched_set_boost(1);
+		if (ret)
 			pr_err("cpu-boost: HMP boost enable failed\n");
 		else
 			sched_boost_active = true;
@@ -369,6 +425,8 @@ static struct input_handler cpuboost_input_handler = {
 
 static int cpu_boost_init(void)
 {
+	int cpu, ret;
+	struct cpu_sync *s;
 	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 2 };
 
 	init_kthread_worker(&cpu_boost_worker);
@@ -383,11 +441,13 @@ static int cpu_boost_init(void)
 	INIT_DELAYED_WORK(&input_boost_work_s2, do_input_boost_s2);
 	INIT_DELAYED_WORK(&input_boost_rem, do_input_boost_rem);
 
-	memset(&cluster0_si, 0, sizeof(struct cpu_sync));
-	memset(&cluster1_si, 0, sizeof(struct cpu_sync));
-
+	for_each_possible_cpu(cpu) {
+		s = &per_cpu(sync_info, cpu);
+		s->cpu = cpu;
+	}
 	cpufreq_register_notifier(&boost_adjust_nb, CPUFREQ_POLICY_NOTIFIER);
+	ret = input_register_handler(&cpuboost_input_handler);
 
-	return input_register_handler(&cpuboost_input_handler);
+	return ret;
 }
 late_initcall(cpu_boost_init);
